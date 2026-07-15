@@ -1,0 +1,15 @@
+services:
+  app:
+    build: .
+    container_name: whatsapp-uptime-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - whatsapp_bot_data:/app/data
+    stop_grace_period: 30s
+
+volumes:
+  whatsapp_bot_data:
