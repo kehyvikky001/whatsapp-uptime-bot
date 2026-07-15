@@ -1,0 +1,23 @@
+services:
+  app:
+    image: ghcr.io/kehyvikky001/whatsapp-uptime-bot:latest
+    container_name: whatsapp-uptime-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - whatsapp_bot_data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 30s
+
+volumes:
+  whatsapp_bot_data:

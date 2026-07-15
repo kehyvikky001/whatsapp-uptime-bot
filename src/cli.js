@@ -1,4 +1,4 @@
-import "dotenv/config";
+import "./load-env.js";
 
 const args = process.argv.slice(2);
 const command = args.shift();
@@ -8,22 +8,28 @@ function option(name) {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
+function requiredOption(name) {
+  const value = option(name);
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
 const baseUrl = process.env.BOT_API_URL || `http://127.0.0.1:${process.env.PORT || 8080}`;
 const token = process.env.ADMIN_TOKEN;
-
 if (!token) {
   console.error("ADMIN_TOKEN is required");
   process.exit(1);
 }
 
-async function request(method, path, body) {
-  const response = await fetch(`${baseUrl}${path}`, {
+async function request(method, endpoint, body) {
+  const response = await fetch(`${baseUrl}${endpoint}`, {
     method,
     headers: {
       authorization: `Bearer ${token}`,
       ...(body ? { "content-type": "application/json" } : {})
     },
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(30000)
   });
 
   const text = await response.text();
@@ -36,35 +42,35 @@ try {
     case "account:list":
       console.table(await request("GET", "/accounts"));
       break;
-    case "account:add": {
-      const id = option("--id");
-      const phoneNumber = option("--phone");
-      console.log(await request("POST", "/accounts", { id, phoneNumber }));
+    case "account:add":
+      console.log(await request("POST", "/accounts", {
+        id: requiredOption("--id"),
+        phoneNumber: requiredOption("--phone")
+      }));
       break;
-    }
     case "account:pair": {
-      const id = option("--id");
+      const id = requiredOption("--id");
       const result = await request("POST", `/accounts/${encodeURIComponent(id)}/pairing-code`);
       console.log(`Pairing code for ${id}: ${result.pairingCode}`);
       break;
     }
     case "account:enable": {
-      const id = option("--id");
+      const id = requiredOption("--id");
       console.log(await request("POST", `/accounts/${encodeURIComponent(id)}/enable`));
       break;
     }
     case "account:disable": {
-      const id = option("--id");
+      const id = requiredOption("--id");
       console.log(await request("POST", `/accounts/${encodeURIComponent(id)}/disable`));
       break;
     }
     case "account:reconnect": {
-      const id = option("--id");
+      const id = requiredOption("--id");
       console.log(await request("POST", `/accounts/${encodeURIComponent(id)}/reconnect`));
       break;
     }
     case "account:remove": {
-      const id = option("--id");
+      const id = requiredOption("--id");
       await request("DELETE", `/accounts/${encodeURIComponent(id)}`);
       console.log(`Removed ${id}`);
       break;

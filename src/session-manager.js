@@ -1,34 +1,87 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import makeWASocket, {
-  Browsers,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-  useMultiFileAuthState
-} from "baileys";
-import { reconnectDelay, sleep } from "./utils.js";
+import { useEncryptedAuthState } from "./encrypted-auth-state.js";
+import { HttpError, reconnectDelay, waitFor } from "./utils.js";
 
 function statusCode(error) {
   return error?.output?.statusCode ?? error?.statusCode ?? error?.data?.statusCode ?? null;
 }
 
+function initialState() {
+  return {
+    socket: null,
+    connectPromise: null,
+    status: "starting",
+    reconnectAttempt: 0,
+    reconnectTimer: null,
+    pairingPromise: null,
+    lastPairingCodeAt: 0,
+    lastConnectedAt: null,
+    lastDisconnectedAt: null,
+    lastStateChangeAt: new Date().toISOString(),
+    lastError: null,
+    degradedAlertSent: false,
+    generation: 0
+  };
+}
+
+let defaultAdaptersPromise;
+
+async function loadDefaultAdapters() {
+  if (!defaultAdaptersPromise) {
+    defaultAdaptersPromise = import("baileys").then((baileys) => ({
+      makeWASocket: baileys.default || baileys.makeWASocket,
+      Browsers: baileys.Browsers,
+      DisconnectReason: baileys.DisconnectReason,
+      fetchLatestBaileysVersion: baileys.fetchLatestBaileysVersion,
+      makeCacheableSignalKeyStore: baileys.makeCacheableSignalKeyStore,
+      authStateFactory: (folder, key) => useEncryptedAuthState(folder, key, {
+        BufferJSON: baileys.BufferJSON,
+        initAuthCreds: baileys.initAuthCreds,
+        proto: baileys.proto
+      })
+    }));
+  }
+  return defaultAdaptersPromise;
+}
+
 export class SessionManager {
-  constructor({ registry, sessionsDir, logger, metrics, config }) {
+  constructor({ registry, sessionsDir, logger, metrics, config, alerts = { send: async () => false }, adapters = null }) {
     this.registry = registry;
     this.sessionsDir = sessionsDir;
     this.logger = logger;
     this.metrics = metrics;
     this.config = config;
+    this.adapters = adapters;
+    this.alerts = alerts;
     this.sessions = new Map();
     this.stopping = false;
+    this.watchdogTimer = null;
+    this.watchdogRunning = false;
+    this.cachedVersion = null;
+    this.versionFetchedAt = 0;
+    this.versionPromise = null;
+  }
+
+  async getAdapters() {
+    if (!this.adapters) this.adapters = await loadDefaultAdapters();
+    return this.adapters;
   }
 
   async startEnabledAccounts() {
-    await fs.mkdir(this.sessionsDir, { recursive: true });
+    await fs.mkdir(this.sessionsDir, { recursive: true, mode: 0o700 });
     for (const account of this.registry.list()) {
       if (account.enabled) void this.connect(account.id);
     }
+    this.watchdogTimer = setInterval(() => {
+      void this.runWatchdog();
+    }, this.config.watchdogIntervalMs);
+    this.watchdogTimer.unref();
+  }
+
+  setStatus(current, status) {
+    current.status = status;
+    current.lastStateChangeAt = new Date().toISOString();
   }
 
   snapshot() {
@@ -41,89 +94,122 @@ export class SessionManager {
         reconnectAttempt: state?.reconnectAttempt || 0,
         lastConnectedAt: state?.lastConnectedAt || null,
         lastDisconnectedAt: state?.lastDisconnectedAt || null,
+        lastStateChangeAt: state?.lastStateChangeAt || null,
         lastError: state?.lastError || null,
-        pairingRequired: state?.status === "logged_out" || state?.status === "pairing_required"
+        pairingRequired: ["logged_out", "pairing_required", "pairing_code_issued"].includes(state?.status)
       };
     });
   }
 
+  async getVersion(accountLogger) {
+    const adapters = await this.getAdapters();
+    if (this.cachedVersion && Date.now() - this.versionFetchedAt < this.config.versionCacheMs) {
+      return this.cachedVersion;
+    }
+    if (!this.versionPromise) {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("version fetch timed out")),
+          this.config.versionFetchTimeoutMs
+        );
+        timer.unref();
+      });
+      this.versionPromise = Promise.race([adapters.fetchLatestBaileysVersion(), timeout])
+        .then(({ version }) => {
+          this.cachedVersion = version;
+          this.versionFetchedAt = Date.now();
+          return version;
+        })
+        .catch((error) => {
+          accountLogger.warn({ err: error }, "could not fetch latest WhatsApp version; using Baileys default");
+          return null;
+        })
+        .finally(() => {
+          clearTimeout(timer);
+          this.versionPromise = null;
+        });
+    }
+    return this.versionPromise;
+  }
+
   async connect(accountId, { force = false } = {}) {
     const account = this.registry.get(accountId);
-    if (!account) throw new Error(`account ${accountId} was not found`);
+    if (!account) throw new HttpError(404, `account ${accountId} was not found`);
     if (!account.enabled && !force) return;
 
     let current = this.sessions.get(accountId);
-    if (current?.connecting || current?.status === "connected") return;
-
     if (!current) {
-      current = {
-        socket: null,
-        connecting: false,
-        status: "starting",
-        reconnectAttempt: 0,
-        reconnectTimer: null,
-        lastConnectedAt: null,
-        lastDisconnectedAt: null,
-        lastError: null,
-        generation: 0
-      };
+      current = initialState();
       this.sessions.set(accountId, current);
     }
 
-    current.connecting = true;
-    current.status = "connecting";
+    if (current.status === "connected" && current.socket) return;
+    if (current.connectPromise) return current.connectPromise;
+    if (current.socket && ["pairing_required", "pairing_code_issued"].includes(current.status)) return;
+
+    current.connectPromise = this.startSocket(account, current)
+      .finally(() => { current.connectPromise = null; });
+    return current.connectPromise;
+  }
+
+  async startSocket(account, current) {
+    if (this.stopping) return;
+    this.setStatus(current, "connecting");
     current.generation += 1;
     const generation = current.generation;
-    const accountLogger = this.logger.child({ accountId });
+    const accountLogger = this.logger.child({ accountId: account.id });
 
     try {
-      const sessionPath = path.join(this.sessionsDir, accountId);
-      await fs.mkdir(sessionPath, { recursive: true, mode: 0o700 });
-
-      const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-      const { version } = await fetchLatestBaileysVersion();
+      const adapters = await this.getAdapters();
+      const sessionPath = path.join(this.sessionsDir, account.id);
+      const { state, saveCreds } = await adapters.authStateFactory(
+        sessionPath,
+        this.config.encryptionKey
+      );
+      const version = await this.getVersion(accountLogger);
 
       if (this.stopping || generation !== current.generation) return;
 
-      const socket = makeWASocket({
-        version,
+      const socketConfig = {
         auth: {
           creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, accountLogger)
+          keys: adapters.makeCacheableSignalKeyStore(state.keys, accountLogger)
         },
         logger: accountLogger,
-        browser: Browsers.ubuntu("Chrome"),
+        browser: adapters.Browsers.ubuntu("Chrome"),
         printQRInTerminal: false,
         markOnlineOnConnect: false,
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
         generateHighQualityLinkPreview: false,
         getMessage: async () => undefined
-      });
+      };
+      if (version) socketConfig.version = version;
 
+      const socket = adapters.makeWASocket(socketConfig);
       current.socket = socket;
-      current.status = state.creds.registered ? "connecting" : "pairing_required";
-      current.connecting = false;
+      this.setStatus(current, state.creds.registered ? "connecting" : "pairing_required");
 
       socket.ev.on("creds.update", async () => {
         try {
           await saveCreds();
         } catch (error) {
-          accountLogger.error({ err: error }, "failed to persist credentials");
+          current.lastError = error instanceof Error ? error.message : String(error);
+          accountLogger.error({ err: error }, "failed to persist encrypted credentials");
         }
       });
 
       socket.ev.on("connection.update", (update) => {
-        void this.handleConnectionUpdate(accountId, generation, update);
+        void this.handleConnectionUpdate(account.id, generation, update);
       });
 
       accountLogger.info({ registered: state.creds.registered }, "WhatsApp session started");
     } catch (error) {
-      current.connecting = false;
-      current.status = "error";
+      this.setStatus(current, "error");
       current.lastError = error instanceof Error ? error.message : String(error);
       accountLogger.error({ err: error }, "failed to start WhatsApp session");
-      this.scheduleReconnect(accountId);
+      this.scheduleReconnect(account.id);
     }
   }
 
@@ -133,12 +219,15 @@ export class SessionManager {
 
     const { connection, lastDisconnect } = update;
     if (connection === "open") {
-      current.status = "connected";
+      this.setStatus(current, "connected");
+      const recovered = current.reconnectAttempt > 0 || current.degradedAlertSent;
       current.reconnectAttempt = 0;
       current.lastConnectedAt = new Date().toISOString();
       current.lastError = null;
+      current.degradedAlertSent = false;
       this.metrics.connections.set({ account: accountId }, 1);
       this.logger.info({ accountId }, "WhatsApp account connected");
+      if (recovered) void this.alerts.send("account_recovered", { accountId });
       return;
     }
 
@@ -153,13 +242,14 @@ export class SessionManager {
     const code = statusCode(error);
     current.lastError = error instanceof Error ? error.message : String(error || "connection closed");
 
-    if (code === DisconnectReason.loggedOut) {
-      current.status = "logged_out";
+    if (code === this.adapters?.DisconnectReason?.loggedOut) {
+      this.setStatus(current, "logged_out");
       this.logger.warn({ accountId }, "account was logged out and must be paired again");
+      void this.alerts.send("account_logged_out", { accountId, error: current.lastError });
       return;
     }
 
-    current.status = "disconnected";
+    this.setStatus(current, "disconnected");
     this.logger.warn({ accountId, code }, "account disconnected; reconnect scheduled");
     this.scheduleReconnect(accountId);
   }
@@ -177,7 +267,18 @@ export class SessionManager {
     );
 
     current.reconnectAttempt += 1;
-    current.status = "reconnect_wait";
+    this.setStatus(current, "reconnect_wait");
+    if (
+      !current.degradedAlertSent &&
+      current.reconnectAttempt >= this.config.alertAfterReconnectAttempts
+    ) {
+      current.degradedAlertSent = true;
+      void this.alerts.send("account_reconnecting", {
+        accountId,
+        attempt: current.reconnectAttempt,
+        error: current.lastError
+      });
+    }
     this.metrics.reconnects.inc({ account: accountId });
 
     current.reconnectTimer = setTimeout(() => {
@@ -191,21 +292,95 @@ export class SessionManager {
 
   async requestPairingCode(accountId) {
     const account = this.registry.get(accountId);
-    if (!account) throw new Error(`account ${accountId} was not found`);
+    if (!account) throw new HttpError(404, `account ${accountId} was not found`);
+    if (!account.enabled) throw new HttpError(409, `account ${accountId} is disabled; enable it before pairing`);
 
-    await this.connect(accountId, { force: true });
-    await sleep(this.config.pairingWaitMs);
+    let current = this.sessions.get(accountId);
+    if (!current) {
+      current = initialState();
+      this.sessions.set(accountId, current);
+    }
 
-    const current = this.sessions.get(accountId);
-    if (!current?.socket) throw new Error("session is not ready; retry in a few seconds");
+    if (current.status === "connected") {
+      throw new HttpError(409, `account ${accountId} is already connected`);
+    }
+    if (current.pairingPromise) return current.pairingPromise;
 
-    const code = await current.socket.requestPairingCode(account.phoneNumber);
-    current.status = "pairing_code_issued";
-    this.logger.info({ accountId }, "pairing code issued");
-    return code;
+    if (current.status === "logged_out") {
+      await this.stop(accountId, { preserveRecord: true });
+      await fs.rm(path.join(this.sessionsDir, accountId), { recursive: true, force: true });
+      current = initialState();
+      this.sessions.set(accountId, current);
+    }
+
+    const elapsed = Date.now() - current.lastPairingCodeAt;
+    if (current.lastPairingCodeAt && elapsed < this.config.pairingCooldownMs) {
+      throw new HttpError(
+        429,
+        `pairing code cooldown active; retry in ${Math.ceil((this.config.pairingCooldownMs - elapsed) / 1000)} seconds`
+      );
+    }
+
+    current.pairingPromise = (async () => {
+      await this.connect(accountId, { force: true });
+      const socket = await waitFor(
+        () => this.sessions.get(accountId)?.socket,
+        this.config.pairingReadyTimeoutMs
+      );
+      if (!socket) throw new HttpError(503, "session is not ready; retry shortly");
+
+      const code = await socket.requestPairingCode(account.phoneNumber);
+      current.lastPairingCodeAt = Date.now();
+      this.setStatus(current, "pairing_code_issued");
+      this.logger.info({ accountId }, "pairing code issued");
+      return code;
+    })().finally(() => { current.pairingPromise = null; });
+
+    return current.pairingPromise;
+  }
+
+  async runWatchdog(now = Date.now()) {
+    if (this.stopping || this.watchdogRunning) return;
+    this.watchdogRunning = true;
+    try {
+      for (const account of this.registry.list()) {
+        if (!account.enabled) continue;
+        const current = this.sessions.get(account.id);
+        if (!current) {
+          void this.connect(account.id);
+          continue;
+        }
+
+        const changedAt = Date.parse(current.lastStateChangeAt || "") || now;
+        const staleConnecting =
+          current.status === "connecting" &&
+          now - changedAt >= this.config.staleConnectingMs;
+
+        if (staleConnecting) {
+          this.logger.warn({ accountId: account.id }, "watchdog restarting stale connection");
+          this.metrics.watchdogRecoveries?.inc({ account: account.id });
+          void this.alerts.send("watchdog_restart", { accountId: account.id });
+          await this.reconnect(account.id);
+          continue;
+        }
+
+        if (
+          ["error", "disconnected", "stopped"].includes(current.status) &&
+          !current.reconnectTimer &&
+          !current.connectPromise
+        ) {
+          void this.connect(account.id);
+        }
+      }
+    } finally {
+      this.watchdogRunning = false;
+    }
   }
 
   async reconnect(accountId) {
+    const account = this.registry.get(accountId);
+    if (!account) throw new HttpError(404, `account ${accountId} was not found`);
+    if (!account.enabled) throw new HttpError(409, `account ${accountId} is disabled`);
     await this.stop(accountId, { preserveRecord: true });
     await this.connect(accountId, { force: true });
   }
@@ -225,9 +400,8 @@ export class SessionManager {
     }
 
     current.socket = null;
-    current.status = "stopped";
-    current.connecting = false;
-
+    current.connectPromise = null;
+    this.setStatus(current, "stopped");
     if (!preserveRecord) this.sessions.delete(accountId);
     this.metrics.connections.set({ account: accountId }, 0);
   }
@@ -240,6 +414,8 @@ export class SessionManager {
 
   async shutdown() {
     this.stopping = true;
-    await Promise.all(this.registry.list().map((account) => this.stop(account.id)));
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = null;
+    await Promise.allSettled(this.registry.list().map((account) => this.stop(account.id)));
   }
 }
